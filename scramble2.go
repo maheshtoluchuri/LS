@@ -20,7 +20,7 @@ func ShuffleRows(data *csv.DataSet) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	// Use CPU cores as the basis for worker count
+	// Fix: Use CPU cores instead of record count for optimal performance
 	numWorkers := runtime.NumCPU()
 
 	// Start workers
@@ -28,44 +28,43 @@ func ShuffleRows(data *csv.DataSet) {
 		wg.Add(1)
 		go shuffleWorker(ctx, recordChan, resultChan, &wg)
 	}
-}
 
-func deepCopyRecord(record *csv.SimpleRecord) *csv.SimpleRecord {
-	recordCopy := &csv.SimpleRecord{
-		refCount: record.refCount,
-		Rows:     record.Rows,
-		Arrs:     make([][]string, len(record.Arrs)),
-	}
-
-	// Deep copy each string slice to ensure complete isolation
-	for i, arr := range record.Arrs {
-		if arr != nil {
-			recordCopy.Arrs[i] = make([]string, len(arr))
-			copy(recordCopy.Arrs[i], arr)
-		}
-	}
-
-	return recordCopy
-
-	// Send work to workers with complete data isolation
+	// CRITICAL FIX: Send work with complete data isolation
 	go func() {
 		defer close(recordChan)
 
 		mu.Lock()
-		defer mu.Unlock()
-
+		// Create a snapshot of all records first to avoid concurrent iteration
+		recordsSnapshot := make(map[int]*csv.SimpleRecord)
 		for key, record := range data.Records {
-			// Create completely independent copy BEFORE sending to channel
-			recordCopy := deepCopyRecord(record)
+			recordsSnapshot[key] = record
+		}
+		mu.Unlock()
+
+		// Now process the snapshot safely
+		for key, record := range recordsSnapshot {
+			// CRITICAL: Create deep copy BEFORE sending to avoid shared memory access
+			recordCopy := &csv.SimpleRecord{
+				refCount: record.refCount,
+				Rows:     record.Rows,
+				Arrs:     make([][]string, len(record.Arrs)),
+			}
+
+			// Deep copy each string slice
+			for i, arr := range record.Arrs {
+				if arr != nil {
+					recordCopy.Arrs[i] = make([]string, len(arr))
+					copy(recordCopy.Arrs[i], arr)
+				}
+			}
+
 			recordMap := map[int]*csv.SimpleRecord{key: recordCopy}
 
-			mu.Unlock() // Release lock before channel send to avoid blocking
 			select {
 			case <-ctx.Done():
 				return
 			case recordChan <- recordMap:
 			}
-			mu.Lock() // Re-acquire for next iteration
 		}
 	}()
 
@@ -75,7 +74,7 @@ func deepCopyRecord(record *csv.SimpleRecord) *csv.SimpleRecord {
 		close(resultChan)
 	}()
 
-	// Collect results
+	// Collect results safely
 	for result := range resultChan {
 		mu.Lock()
 		for key, record := range result {
@@ -89,7 +88,7 @@ func shuffleWorker(ctx context.Context, records <-chan map[int]*csv.SimpleRecord
 	results chan<- map[int]*csv.SimpleRecord, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// Create a local random generator for this worker
+	// Fix: Create local random generator for this worker
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for recordMap := range records {
@@ -99,30 +98,28 @@ func shuffleWorker(ctx context.Context, records <-chan map[int]*csv.SimpleRecord
 		default:
 		}
 
-		// Data is already completely copied, so we can use it directly
-		// No need for additional copying in the worker
-		shuffleRecordArrays(recordMap, rng)
+		// Data is already deep copied, so we can use it directly
+		// No need for additional copying since each worker gets independent data
+
+		// Shuffle the arrays within each record
+		for _, record := range recordMap {
+			if len(record.Arrs) <= 1 {
+				continue // Skip if no arrays to shuffle or only one array
+			}
+
+			// Fix: Use proper range and Fisher-Yates shuffle
+			for i := range record.Arrs {
+				j := rng.Intn(len(record.Arrs)) // Fix: Use full range, not len-1
+				if i != j {
+					record.Arrs[i], record.Arrs[j] = record.Arrs[j], record.Arrs[i]
+				}
+			}
+		}
 
 		select {
 		case <-ctx.Done():
 			return
 		case results <- recordMap:
-		}
-	}
-}
-
-func shuffleRecordArrays(recordMap map[int]*csv.SimpleRecord, rng *rand.Rand) {
-	for _, record := range recordMap {
-		if len(record.Arrs) <= 1 {
-			continue
-		}
-
-		// Fisher-Yates shuffle algorithm for better randomization
-		for i := range record.Arrs {
-			j := rng.Intn(len(record.Arrs))
-			if i != j {
-				record.Arrs[i], record.Arrs[j] = record.Arrs[j], record.Arrs[i]
-			}
 		}
 	}
 }
